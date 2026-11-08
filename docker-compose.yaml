@@ -1,9 +1,14 @@
 services:
+  broker:
+    build: ./broker          # REQ/REP: ROUTER :5555 (bots) <-> DEALER :5556 (servidores)
 
   proxy:
-    build: ./proxy
-  broker:
-    build: ./broker          # ROUTER :5555 (bots) <-> DEALER :5556 (servidores)
+    build: ./proxy           # PUB/SUB: XSUB :5557 (servidores) <-> XPUB :5558 (bots)
+
+  referencia:
+    build: ./referencia      # REP :5559 (só servidores): rank, lista, heartbeat e hora
+    # environment:
+    #   HEARTBEAT_TIMEOUT: "30"   # segundos sem heartbeat até o servidor ser removido da lista
 
   server1:
     build: ./servidor
@@ -11,24 +16,25 @@ services:
       SERVER_NAME: server1
     volumes:
       - ./data/server1:/data
-    depends_on: [broker,proxy]
+    depends_on: [broker, proxy, referencia]
 
   server2:
     build: ./servidor
     environment:
       SERVER_NAME: server2
+      # CLOCK_SKEW: "5"   # descomente para simular um relógio 5 s adiantado (teste da sincronização)
     volumes:
       - ./data/server2:/data
-    depends_on: [broker,proxy]
+    depends_on: [broker, proxy, referencia]
 
   bot1:
     build: ./bot
     environment:
       BOT_NAME: bot1
-    depends_on: [broker, server1, server2,proxy]
+    depends_on: [broker, proxy, server1, server2]
 
   bot2:
     build: ./bot
     environment:
       BOT_NAME: bot2
-    depends_on: [broker, server1, server2,proxy]
+    depends_on: [broker, proxy, server1, server2]
