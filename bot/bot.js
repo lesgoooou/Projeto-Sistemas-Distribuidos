@@ -60,6 +60,15 @@ async function listarCanais() {
   return r && r.status === "ok" ? r.dados.canais : [];
 }
 
+// Pede o histórico do canal (últimas 3 mensagens). Qualquer servidor responde com o histórico completo.
+async function mostrarHistorico(canal) {
+  const r = await enviar("historico", { canal, limite: 3 });
+  if (r && r.status === "ok") {
+    const ult = r.dados.mensagens.map((m) => `${m.usuario}: "${m.texto}"`);
+    console.log(`[${NAME}] HISTORICO canal=${canal} total=${r.dados.total} ultimas=${JSON.stringify(ult)}`);
+  }
+}
+
 // ---------------------------------------------------------------- socket SUB
 const sub = new zmq.Subscriber();
 sub.connect(PROXY);
@@ -114,7 +123,11 @@ async function main() {
     }
 
     const livres = canais.filter((c) => !inscritos.has(c));
-    if (inscritos.size < 3 && livres.length > 0) inscrever(sorteia(livres));
+    if (inscritos.size < 3 && livres.length > 0) {
+      const novo = sorteia(livres);
+      inscrever(novo);
+      await mostrarHistorico(novo);   // Parte 5: ao assinar, recupera as mensagens anteriores do canal
+    }
 
     if (canais.length === 0) { await sleep(1000); continue; }
     const canal = sorteia(canais);

@@ -1,9 +1,12 @@
-"""Servidor - Partes 1 a 4: login, canais, publicação, relógios, rank, heartbeat, eleição e Berkeley.
-Cada servidor tem o seu próprio banco SQLite (não compartilhado com os outros)."""
+"""Servidor - Partes 1 a 5: login, canais, publicação, relógios, rank, heartbeat, eleição e REPLICAÇÃO.
+Cada servidor tem o seu próprio banco SQLite, e todos os bancos convergem para o mesmo conteúdo:
+cada registro novo é replicado aos outros servidores (tópico "replica") e quem ficou fora recupera o que perdeu."""
 import os
+import random
 import re
 import sqlite3
 import time
+import uuid
 from datetime import datetime
 
 import msgpack
@@ -21,7 +24,10 @@ PEER_ADDR = os.getenv("PEER_ADDR", "tcp://{nome}:6000")        # endereço de um
 PEER_TIMEOUT_MS = 2000                                         # quanto esperar uma resposta de outro servidor
 HEARTBEAT_A_CADA = int(os.getenv("HEARTBEAT_A_CADA", "10"))    # mensagens de clientes entre heartbeats
 SYNC_A_CADA = int(os.getenv("SYNC_A_CADA", "15"))              # mensagens de clientes entre sincronizações do relógio
-TOPICO_SERVIDORES = "servers"                                  # tópico reservado para anunciar o coordenador
+RECONCILIAR_A_CADA = int(os.getenv("RECONCILIAR_A_CADA", "100"))  # mensagens de clientes entre conferências de dados
+TOPICO_SERVIDORES = "servers"                                  # tópico reservado: anúncio do coordenador
+TOPICO_REPLICA = "replica"                                     # tópico reservado: replicação de registros
+RESERVADOS = {TOPICO_SERVIDORES, TOPICO_REPLICA}               # nomes que os bots não podem usar como canal
 
 RE_USUARIO = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # nomes de usuário permitidos
 RE_CANAL = re.compile(r"^[a-z0-9_-]{1,32}$")        # nomes de canal permitidos
@@ -55,9 +61,12 @@ def hora(ts: float) -> str:
 
 
 def log(direcao: str, msg: dict, extra: str = "") -> None:
+    dados = str(msg.get("dados"))
+    if len(dados) > 400:                      # sincronizações carregam listas enormes
+        dados = dados[:400] + f"... (+{len(dados) - 400} caracteres)"
     print(
         f"[{NAME}] {direcao:<8} tipo={msg.get('tipo')} ts={hora(msg['ts'])} "
-        f"clock={msg.get('clock')} dados={msg.get('dados')} {extra}".rstrip(),
+        f"clock={msg.get('clock')} dados={dados} {extra}".rstrip(),
         flush=True,
     )
 
@@ -70,15 +79,114 @@ def mensagem(tipo: str, dados: dict, **campos) -> dict:
 # ------------------------------------------------------------- persistência
 os.makedirs(DATA_DIR, exist_ok=True)
 db = sqlite3.connect(os.path.join(DATA_DIR, f"{NAME}.db"))
+
+# Todo registro tem: id único, origem (servidor que o criou) e clock lógico de quando foi criado.
+COLUNAS = {
+    "logins":    ("id", "origem", "clock", "usuario", "ts"),
+    "canais":    ("id", "origem", "clock", "nome", "ts"),
+    "mensagens": ("id", "origem", "clock", "canal", "usuario", "texto", "ts_envio", "ts_publicacao"),
+}
+
+# Bancos criados nas Partes 1 a 4 não tinham "id": as tabelas antigas são renomeadas (nada é apagado).
+for tabela in COLUNAS:
+    atuais = [r[1] for r in db.execute(f"PRAGMA table_info({tabela})")]
+    if atuais and "id" not in atuais:
+        db.execute(f"ALTER TABLE {tabela} RENAME TO {tabela}_antigo")
+        print(f"[{NAME}] BANCO    tabela antiga '{tabela}' renomeada para '{tabela}_antigo'", flush=True)
 db.executescript(
     """
-    CREATE TABLE IF NOT EXISTS logins (usuario TEXT, ts REAL);
-    CREATE TABLE IF NOT EXISTS canais (nome TEXT PRIMARY KEY);
-    CREATE TABLE IF NOT EXISTS mensagens (canal TEXT, usuario TEXT, texto TEXT,
-                                          ts_envio REAL, ts_publicacao REAL);
+    CREATE TABLE IF NOT EXISTS logins (id TEXT PRIMARY KEY, origem TEXT, clock INTEGER,
+                                       usuario TEXT, ts REAL);
+    CREATE TABLE IF NOT EXISTS canais (id TEXT PRIMARY KEY, origem TEXT, clock INTEGER,
+                                       nome TEXT, ts REAL);
+    CREATE TABLE IF NOT EXISTS mensagens (id TEXT PRIMARY KEY, origem TEXT, clock INTEGER, canal TEXT,
+                                          usuario TEXT, texto TEXT, ts_envio REAL, ts_publicacao REAL);
     """
 )
 db.commit()
+
+
+def estatisticas() -> str:
+    return " ".join(f"{t}={db.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]}" for t in COLUNAS)
+
+
+# -------------------------------------------------------------- replicação
+def gravar(tabela: str, reg: dict) -> bool:
+    """Grava o registro se ainda não existir (INSERT OR IGNORE pelo id). Devolve True se era novo.
+    Como a gravação é idempotente, receber o mesmo registro duas vezes não causa problema."""
+    cols = COLUNAS[tabela]
+    cur = db.execute(
+        f"INSERT OR IGNORE INTO {tabela} ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+        [reg.get(c) for c in cols],
+    )
+    db.commit()
+    return cur.rowcount == 1
+
+
+def replicar(tabela: str, reg: dict) -> None:
+    """Envia um registro novo a todos os outros servidores (tópico 'replica')."""
+    msg = mensagem("replica", {"tabela": tabela, "registro": reg})
+    pub_sock.send_multipart([TOPICO_REPLICA.encode(), msgpack.packb(msg)])
+    log("PUBLICADO", msg, f"-> tópico '{TOPICO_REPLICA}'")
+
+
+def criar_registro(tabela: str, **campos) -> dict:
+    """Cria um registro NOVO neste servidor: grava e replica."""
+    reg = {"id": campos.pop("id", None) or f"{NAME}-{uuid.uuid4().hex[:10]}",
+           "origem": NAME, "clock": clock, **campos}
+    if gravar(tabela, reg):
+        replicar(tabela, reg)
+    return reg
+
+
+def aplicar_replica(tabela, reg) -> bool:
+    """Grava um registro que veio de OUTRO servidor (não republica, para não gerar eco)."""
+    if tabela not in COLUNAS or not isinstance(reg, dict) or not reg.get("id"):
+        return False
+    return gravar(tabela, reg)
+
+
+def ids_locais() -> dict:
+    return {t: [r[0] for r in db.execute(f"SELECT id FROM {t}")] for t in COLUNAS}
+
+
+def registros_que_faltam(ids_do_outro: dict) -> dict:
+    """Registros que EU tenho e o outro servidor (que mandou a lista de ids dele) não tem."""
+    resultado = {}
+    for t, cols in COLUNAS.items():
+        conhecidos = set(ids_do_outro.get(t, []))
+        linhas = db.execute(f"SELECT {', '.join(cols)} FROM {t}")
+        resultado[t] = [dict(zip(cols, l)) for l in linhas if l[0] not in conhecidos]
+    return resultado
+
+
+def ressincronizar(nome: str, timeout_ms: int = 3000) -> bool:
+    """Anti-entropia: mando a lista de ids que tenho e gravo o que o servidor 'nome' tiver a mais."""
+    resp = pedir_peer(nome, "sincronizar", {"ids": ids_locais()}, timeout_ms=timeout_ms)
+    if not (resp and resp.get("status") == "ok"):
+        return False
+    novos = sum(aplicar_replica(t, r) for t, regs in resp["dados"]["registros"].items() for r in regs)
+    print(f"[{NAME}] REPLICA  sincronizado com {nome}: +{novos} registros | {estatisticas()}", flush=True)
+    return True
+
+
+def sincronizar_inicio() -> None:
+    """Ao entrar (ou voltar), copia de um servidor vivo tudo o que perdeu enquanto esteve fora."""
+    lista = pedir_ref("list")
+    if not (lista and lista.get("status") == "ok"):
+        return
+    for x in lista["dados"]["servidores"]:
+        if x["nome"] != NAME and ressincronizar(x["nome"], timeout_ms=10000):
+            return                                  # um servidor vivo basta
+
+
+def reconciliar() -> None:
+    """Conferência periódica com um servidor qualquer: conserta o que uma publicação perdida deixou faltando."""
+    lista = pedir_ref("list")
+    if lista and lista.get("status") == "ok":
+        outros = [x["nome"] for x in lista["dados"]["servidores"] if x["nome"] != NAME]
+        if outros:
+            ressincronizar(random.choice(outros))
 
 
 # ----------------------------------------------------------------- handlers
@@ -87,8 +195,7 @@ def h_login(d):
     usuario = d.get("usuario", "")
     if not RE_USUARIO.match(usuario):
         return "erro", "usuário inválido (letras, números, _ ou -; até 32)", {}
-    db.execute("INSERT INTO logins VALUES (?, ?)", (usuario, agora()))  # guarda o login + timestamp
-    db.commit()
+    criar_registro("logins", usuario=usuario, ts=agora())      # grava o login + timestamp e replica
     return "ok", "login realizado", {}
 
 
@@ -96,12 +203,12 @@ def h_criar_canal(d):
     nome = d.get("canal", "")
     if not RE_CANAL.match(nome):
         return "erro", "nome de canal inválido (minúsculas, números, _ ou -)", {}
-    if nome == TOPICO_SERVIDORES:
+    if nome in RESERVADOS:
         return "erro", "nome de canal reservado", {}
     if db.execute("SELECT 1 FROM canais WHERE nome = ?", (nome,)).fetchone():
         return "erro", "canal já existe", {}
-    db.execute("INSERT INTO canais VALUES (?)", (nome,))
-    db.commit()
+    # id derivado do nome: se dois servidores criarem o mesmo canal ao mesmo tempo, o registro é o mesmo
+    criar_registro("canais", id=f"canal:{nome}", nome=nome, ts=agora())
     return "ok", "canal criado", {}
 
 
@@ -114,19 +221,33 @@ def h_publicar(d):
     canal, usuario, texto = d.get("canal"), d.get("usuario"), d.get("mensagem")
     if not (canal and usuario and texto):
         return "erro", "campos obrigatórios: canal, usuario, mensagem", {}
-    if canal == TOPICO_SERVIDORES:
+    if canal in RESERVADOS:
         return "erro", "nome de canal reservado", {}
-    # Com round-robin este servidor pode não conhecer o canal (foi criado em outro).
-    # Até a Parte 5 (replicação), registramos o canal localmente.
-    db.execute("INSERT OR IGNORE INTO canais VALUES (?)", (canal,))
+    # Se a réplica do canal ainda não chegou aqui (milissegundos de atraso), registra e replica o canal.
+    if not db.execute("SELECT 1 FROM canais WHERE nome = ?", (canal,)).fetchone():
+        criar_registro("canais", id=f"canal:{canal}", nome=canal, ts=agora())
     pub = mensagem("publicacao", {"canal": canal, "usuario": usuario, "mensagem": texto})
-    # 1) grava em disco  2) publica no proxy, usando o nome do canal como tópico
-    db.execute("INSERT INTO mensagens VALUES (?, ?, ?, ?, ?)",
-               (canal, usuario, texto, d.get("_ts_envio"), pub["ts"]))
-    db.commit()
+    # 1) grava em disco e replica para os outros servidores
+    criar_registro("mensagens", canal=canal, usuario=usuario, texto=texto,
+                   ts_envio=d.get("_ts_envio"), ts_publicacao=pub["ts"], clock=pub["clock"])
+    # 2) publica no canal (tópico = nome do canal) para os bots inscritos
     pub_sock.send_multipart([canal.encode(), msgpack.packb(pub)])
     log("PUBLICADO", pub, f"-> tópico '{canal}'")
     return "ok", "mensagem publicada", {}
+
+
+def h_historico(d):
+    """Devolve as últimas mensagens de um canal. Como todos os servidores têm todos os dados,
+    qualquer um responde com o histórico completo."""
+    canal = d.get("canal")
+    limite = max(1, min(int(d.get("limite") or 50), 200))
+    total = db.execute("SELECT COUNT(*) FROM mensagens WHERE canal = ?", (canal,)).fetchone()[0]
+    linhas = db.execute(
+        "SELECT usuario, texto, ts_publicacao, clock, origem FROM mensagens WHERE canal = ? "
+        "ORDER BY clock DESC, origem DESC, id DESC LIMIT ?", (canal, limite)).fetchall()
+    msgs = [{"usuario": u, "texto": t, "ts": ts, "clock": c, "origem": o}
+            for (u, t, ts, c, o) in reversed(linhas)]               # do mais antigo ao mais novo
+    return "ok", "", {"canal": canal, "total": total, "mensagens": msgs}
 
 
 HANDLERS = {
@@ -134,6 +255,7 @@ HANDLERS = {
     "criar_canal": h_criar_canal,
     "listar": h_listar,
     "publicar": h_publicar,
+    "historico": h_historico,
 }
 
 # ------------------------------------------------------------------- sockets
@@ -181,13 +303,13 @@ def obter_rank():
 
 
 # ------------------------------------------------- conversa entre servidores (Parte 4)
-def pedir_peer(nome, tipo, dados=None):
+def pedir_peer(nome, tipo, dados=None, timeout_ms=PEER_TIMEOUT_MS):
     """REQ/REP com outro servidor. Devolve a resposta, ou None se ele não responder."""
     msg = mensagem(tipo, dados or {})
     log("ENVIADO", msg, f"-> {nome}")
     sock = ctx.socket(zmq.REQ)           # um socket novo por conversa: não fica "preso" se falhar
-    sock.setsockopt(zmq.RCVTIMEO, PEER_TIMEOUT_MS)
-    sock.setsockopt(zmq.SNDTIMEO, PEER_TIMEOUT_MS)
+    sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
     sock.setsockopt(zmq.LINGER, 0)
     try:
         sock.connect(PEER_ADDR.format(nome=nome))
@@ -268,6 +390,7 @@ def heartbeat():
         ranks_vistos.update({x["nome"]: x["rank"] for x in lista["dados"]["servidores"]})
         print(f"[{NAME}] SERVIDORES disponíveis: " +
               ", ".join(f"{x['nome']}(rank {x['rank']})" for x in lista["dados"]["servidores"]), flush=True)
+        print(f"[{NAME}] DADOS    {estatisticas()}", flush=True)     # compare entre os servidores
         if coordenador and coordenador != NAME and coordenador not in nomes:
             print(f"[{NAME}] COORDENADOR {coordenador} saiu da lista de servidores", flush=True)
             eleicao()
@@ -286,9 +409,11 @@ pub_sock.connect(PROXY)
 sub = ctx.socket(zmq.SUB)         # escuta o tópico "servers" no proxy (saída XPUB)
 sub.connect(PROXY_XPUB)
 sub.setsockopt(zmq.SUBSCRIBE, TOPICO_SERVIDORES.encode())
+sub.setsockopt(zmq.SUBSCRIBE, TOPICO_REPLICA.encode())      # registros replicados pelos outros servidores
 
 time.sleep(1)    # dá tempo das conexões PUB/SUB se estabelecerem antes do primeiro anúncio
 eleicao()        # ao entrar, o servidor descobre (ou assume) o coordenador
+sincronizar_inicio()   # e copia o que perdeu enquanto esteve fora (antes de atender os bots)
 
 rep = ctx.socket(zmq.REP)         # recebe as requisições dos bots, vindas do broker
 rep.connect(BROKER)
@@ -311,6 +436,9 @@ def atender_peer():
             resp = mensagem("resposta", {"hora": agora()}, status="ok", msg="")   # REP: hora correta
         else:
             resp = mensagem("resposta", {}, status="erro", msg="não sou o coordenador")
+    elif req.get("tipo") == "sincronizar":
+        faltantes = registros_que_faltam((req.get("dados") or {}).get("ids") or {})
+        resp = mensagem("resposta", {"registros": faltantes}, status="ok", msg="")
     else:
         resp = mensagem("resposta", {}, status="erro", msg=f"tipo desconhecido: {req.get('tipo')}")
     peer_rep.send(msgpack.packb(resp))
@@ -319,10 +447,25 @@ def atender_peer():
         depois()
 
 
+def atender_replica(raw):
+    """Chegou um registro replicado por outro servidor: grava se ainda não tinha."""
+    msg = msgpack.unpackb(raw)
+    atualizar_clock(msg.get("clock"))
+    dados = msg.get("dados") or {}
+    reg = dados.get("registro") or {}
+    if reg.get("origem") == NAME:                # eco do que eu mesmo publiquei
+        return
+    novo = aplicar_replica(dados.get("tabela"), reg)
+    log("RECEBIDO", msg, f"<- tópico '{TOPICO_REPLICA}' ({'novo' if novo else 'já existia'})")
+
+
 def atender_anuncio():
-    """Chegou uma publicação no tópico 'servers': alguém foi eleito coordenador."""
+    """Chegou uma publicação em um tópico dos servidores: 'replica' ou 'servers' (novo coordenador)."""
     global coordenador
     topico, raw = sub.recv_multipart()
+    if topico == TOPICO_REPLICA.encode():
+        atender_replica(raw)
+        return
     if topico != TOPICO_SERVIDORES.encode():     # assinatura é por prefixo: ignora "servers_x" etc.
         return
     msg = msgpack.unpackb(raw)
@@ -373,6 +516,8 @@ def atender_cliente():
         heartbeat()
     if recebidas % SYNC_A_CADA == 0:           # a cada 15 mensagens de clientes
         sincronizar_relogio()
+    if recebidas % RECONCILIAR_A_CADA == 0:    # a cada 100 mensagens de clientes
+        reconciliar()
 
 
 # --------------------------------------------------------------------- loop
