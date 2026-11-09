@@ -1,4 +1,4 @@
-"""Servidor - Partes 1 a 3: login, canais, publicação, relógio lógico, rank e heartbeat.
+"""Servidor - Partes 1 a 4: login, canais, publicação, relógios, rank, heartbeat, eleição e Berkeley.
 Cada servidor tem o seu próprio banco SQLite (não compartilhado com os outros)."""
 import os
 import re
@@ -15,7 +15,13 @@ PROXY = os.getenv("PROXY_XSUB", "tcp://proxy:5557")      # onde o servidor publi
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 REF = os.getenv("REF_ADDR", "tcp://referencia:5559")          # serviço de referência
 CLOCK_SKEW = float(os.getenv("CLOCK_SKEW", "0"))              # simula relógio físico errado (teste)
-HEARTBEAT_A_CADA = 10                                          # mensagens de clientes entre heartbeats
+PROXY_XPUB = os.getenv("PROXY_XPUB", "tcp://proxy:5558")      # de onde o servidor escuta o tópico "servers"
+PEER_BIND = os.getenv("PEER_BIND", "tcp://*:6000")             # porta em que este servidor atende outros servidores
+PEER_ADDR = os.getenv("PEER_ADDR", "tcp://{nome}:6000")        # endereço de um servidor (nome = nome do serviço no compose)
+PEER_TIMEOUT_MS = 2000                                         # quanto esperar uma resposta de outro servidor
+HEARTBEAT_A_CADA = int(os.getenv("HEARTBEAT_A_CADA", "10"))    # mensagens de clientes entre heartbeats
+SYNC_A_CADA = int(os.getenv("SYNC_A_CADA", "15"))              # mensagens de clientes entre sincronizações do relógio
+TOPICO_SERVIDORES = "servers"                                  # tópico reservado para anunciar o coordenador
 
 RE_USUARIO = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # nomes de usuário permitidos
 RE_CANAL = re.compile(r"^[a-z0-9_-]{1,32}$")        # nomes de canal permitidos
@@ -90,6 +96,8 @@ def h_criar_canal(d):
     nome = d.get("canal", "")
     if not RE_CANAL.match(nome):
         return "erro", "nome de canal inválido (minúsculas, números, _ ou -)", {}
+    if nome == TOPICO_SERVIDORES:
+        return "erro", "nome de canal reservado", {}
     if db.execute("SELECT 1 FROM canais WHERE nome = ?", (nome,)).fetchone():
         return "erro", "canal já existe", {}
     db.execute("INSERT INTO canais VALUES (?)", (nome,))
@@ -106,6 +114,8 @@ def h_publicar(d):
     canal, usuario, texto = d.get("canal"), d.get("usuario"), d.get("mensagem")
     if not (canal and usuario and texto):
         return "erro", "campos obrigatórios: canal, usuario, mensagem", {}
+    if canal == TOPICO_SERVIDORES:
+        return "erro", "nome de canal reservado", {}
     # Com round-robin este servidor pode não conhecer o canal (foi criado em outro).
     # Até a Parte 5 (replicação), registramos o canal localmente.
     db.execute("INSERT OR IGNORE INTO canais VALUES (?)", (canal,))
@@ -128,6 +138,8 @@ HANDLERS = {
 
 # ------------------------------------------------------------------- sockets
 ctx = zmq.Context()
+coordenador = None    # nome do servidor eleito coordenador (None = ainda não sabemos)
+ranks_vistos = {}     # nome -> rank, atualizado a cada lista recebida da referência
 
 
 def novo_req_ref():
@@ -168,40 +180,175 @@ def obter_rank():
         time.sleep(1)
 
 
-def heartbeat():
-    """Avisa que está vivo e aproveita a resposta para acertar o relógio físico."""
+# ------------------------------------------------- conversa entre servidores (Parte 4)
+def pedir_peer(nome, tipo, dados=None):
+    """REQ/REP com outro servidor. Devolve a resposta, ou None se ele não responder."""
+    msg = mensagem(tipo, dados or {})
+    log("ENVIADO", msg, f"-> {nome}")
+    sock = ctx.socket(zmq.REQ)           # um socket novo por conversa: não fica "preso" se falhar
+    sock.setsockopt(zmq.RCVTIMEO, PEER_TIMEOUT_MS)
+    sock.setsockopt(zmq.SNDTIMEO, PEER_TIMEOUT_MS)
+    sock.setsockopt(zmq.LINGER, 0)
+    try:
+        sock.connect(PEER_ADDR.format(nome=nome))
+        sock.send(msgpack.packb(msg))
+        resp = msgpack.unpackb(sock.recv())
+    except zmq.ZMQError:                 # inclui timeout (zmq.Again) e nome que não resolve
+        print(f"[{NAME}] ERRO     {nome} não respondeu ({tipo})", flush=True)
+        return None
+    finally:
+        sock.close()
+    atualizar_clock(resp.get("clock"))
+    log("RECEBIDO", resp, f"<- {nome}")
+    return resp
+
+
+def anunciar_coordenador():
+    """Eu venci a eleição: aviso todos os servidores publicando no tópico 'servers'."""
+    global coordenador
+    coordenador = NAME
+    msg = mensagem("coordenador", {"coordenador": NAME})
+    pub_sock.send_multipart([TOPICO_SERVIDORES.encode(), msgpack.packb(msg)])
+    log("PUBLICADO", msg, f"-> tópico '{TOPICO_SERVIDORES}'")
+    print(f"[{NAME}] COORDENADOR agora: {NAME}", flush=True)
+
+
+def eleicao():
+    """Eleição pelo rank: pergunto aos servidores de rank MAIOR que o meu.
+    Se algum responder OK, ele assume a eleição. Se ninguém responder, eu sou o coordenador."""
+    print(f"[{NAME}] ELEICAO  iniciada (meu rank={RANK})", flush=True)
+    lista = pedir_ref("list")
+    if not (lista and lista.get("status") == "ok"):
+        print(f"[{NAME}] ELEICAO  adiada: referência indisponível", flush=True)
+        return
+    ranks_vistos.update({x["nome"]: x["rank"] for x in lista["dados"]["servidores"]})
+    maiores = [x["nome"] for x in lista["dados"]["servidores"] if x["rank"] > RANK]
+    alguem_respondeu = False
+    for nome in maiores:
+        resp = pedir_peer(nome, "eleicao")
+        if resp and resp.get("status") == "ok":
+            alguem_respondeu = True
+    if alguem_respondeu:
+        print(f"[{NAME}] ELEICAO  um servidor de rank maior respondeu OK; aguardo o anúncio dele", flush=True)
+    else:
+        print(f"[{NAME}] ELEICAO  ninguém de rank maior respondeu: eu sou o coordenador", flush=True)
+        anunciar_coordenador()
+
+
+def sincronizar_relogio():
+    """Pede a hora correta ao coordenador e ajusta o relógio físico.
+    Se o coordenador não responder, ele é considerado indisponível e começa uma eleição."""
     global offset
+    if coordenador == NAME:
+        print(f"[{NAME}] RELOGIO  sou o coordenador: meu relógio é a referência", flush=True)
+        return
+    if coordenador is None:
+        eleicao()
+        return
     t0 = time.time()
-    resp = pedir_ref("heartbeat", {"nome": NAME})
+    resp = pedir_peer(coordenador, "relogio")
     t1 = time.time()
-    if resp and resp.get("status") == "ok":
-        # a hora da referência já "envelheceu" ~metade do tempo de ida e volta
-        hora_ref = resp["dados"]["hora"] + (t1 - t0) / 2
-        antes = offset
-        offset = hora_ref - t1
-        print(f"[{NAME}] RELOGIO  ajuste de {offset - antes:+.3f}s "
-              f"(offset {antes:+.3f}s -> {offset:+.3f}s)", flush=True)
+    if not (resp and resp.get("status") == "ok"):
+        print(f"[{NAME}] COORDENADOR {coordenador} indisponível", flush=True)
+        eleicao()
+        return
+    hora_ref = resp["dados"]["hora"] + (t1 - t0) / 2   # compensa o tempo de ida e volta
+    antes = offset
+    offset = hora_ref - t1
+    print(f"[{NAME}] RELOGIO  ajuste de {offset - antes:+.3f}s com {coordenador} "
+          f"(offset {antes:+.3f}s -> {offset:+.3f}s)", flush=True)
+
+
+def heartbeat():
+    """Avisa a referência que está vivo (a resposta não traz mais a hora)."""
+    pedir_ref("heartbeat", {"nome": NAME})
     lista = pedir_ref("list")
     if lista and lista.get("status") == "ok":
-        txt = ", ".join(f"{x['nome']}(rank {x['rank']})" for x in lista["dados"]["servidores"])
-        print(f"[{NAME}] SERVIDORES disponíveis: {txt}", flush=True)
+        nomes = [x["nome"] for x in lista["dados"]["servidores"]]
+        ranks_vistos.update({x["nome"]: x["rank"] for x in lista["dados"]["servidores"]})
+        print(f"[{NAME}] SERVIDORES disponíveis: " +
+              ", ".join(f"{x['nome']}(rank {x['rank']})" for x in lista["dados"]["servidores"]), flush=True)
+        if coordenador and coordenador != NAME and coordenador not in nomes:
+            print(f"[{NAME}] COORDENADOR {coordenador} saiu da lista de servidores", flush=True)
+            eleicao()
 
 
-# O rank é pedido ANTES de conectar ao broker, para não receber trabalho sem estar pronto
-RANK = obter_rank()
+# ----------------------------------------------------------- inicialização
+RANK = obter_rank()    # pedido ANTES de conectar ao broker, para não receber trabalho sem estar pronto
 print(f"[{NAME}] rank={RANK}", flush=True)
 
-rep = ctx.socket(zmq.REP)       # recebe as requisições que vêm do broker
-rep.connect(BROKER)
+peer_rep = ctx.socket(zmq.REP)    # atende outros servidores: eleição e relógio
+peer_rep.bind(PEER_BIND)
 
-pub_sock = ctx.socket(zmq.PUB)  # publica no proxy (entrada XSUB)
+pub_sock = ctx.socket(zmq.PUB)    # publica no proxy (entrada XSUB)
 pub_sock.connect(PROXY)
+
+sub = ctx.socket(zmq.SUB)         # escuta o tópico "servers" no proxy (saída XPUB)
+sub.connect(PROXY_XPUB)
+sub.setsockopt(zmq.SUBSCRIBE, TOPICO_SERVIDORES.encode())
+
+time.sleep(1)    # dá tempo das conexões PUB/SUB se estabelecerem antes do primeiro anúncio
+eleicao()        # ao entrar, o servidor descobre (ou assume) o coordenador
+
+rep = ctx.socket(zmq.REP)         # recebe as requisições dos bots, vindas do broker
+rep.connect(BROKER)
 
 print(f"[{NAME}] pronto. broker={BROKER} proxy={PROXY} ref={REF}", flush=True)
 
-# --------------------------------------------------------------------- loop
+
+# ------------------------------------------------------------------ atendimento
+def atender_peer():
+    """Outro servidor pediu 'eleicao' ou 'relogio'."""
+    req = msgpack.unpackb(peer_rep.recv())
+    atualizar_clock(req.get("clock"))
+    log("RECEBIDO", req, "<- servidor")
+    depois = None
+    if req.get("tipo") == "eleicao":
+        resp = mensagem("resposta", {}, status="ok", msg="OK")      # REP: OK
+        depois = eleicao                                            # e eu assumo a eleição
+    elif req.get("tipo") == "relogio":
+        if coordenador == NAME:
+            resp = mensagem("resposta", {"hora": agora()}, status="ok", msg="")   # REP: hora correta
+        else:
+            resp = mensagem("resposta", {}, status="erro", msg="não sou o coordenador")
+    else:
+        resp = mensagem("resposta", {}, status="erro", msg=f"tipo desconhecido: {req.get('tipo')}")
+    peer_rep.send(msgpack.packb(resp))
+    log("ENVIADO", resp, f"status={resp['status']} {resp['msg']}")
+    if depois:
+        depois()
+
+
+def atender_anuncio():
+    """Chegou uma publicação no tópico 'servers': alguém foi eleito coordenador."""
+    global coordenador
+    topico, raw = sub.recv_multipart()
+    if topico != TOPICO_SERVIDORES.encode():     # assinatura é por prefixo: ignora "servers_x" etc.
+        return
+    msg = msgpack.unpackb(raw)
+    atualizar_clock(msg.get("clock"))
+    log("RECEBIDO", msg, f"<- tópico '{TOPICO_SERVIDORES}'")
+    novo = msg["dados"]["coordenador"]
+    if novo == NAME:        # eco do meu próprio anúncio (o proxy devolve para mim também): já registrei
+        return
+    rank_novo = ranks_vistos.get(novo)
+    if rank_novo is not None and rank_novo < RANK:
+        # Se um servidor de rank MENOR se declarou coordenador mas eu (maior) estou vivo,
+        # não aceito: assumo a eleição (isso desfaz duas eleições simultâneas).
+        print(f"[{NAME}] ANUNCIO  de {novo} (rank {rank_novo}) não aceito: meu rank ({RANK}) é maior", flush=True)
+        eleicao()
+        return
+    if novo != coordenador:
+        coordenador = novo
+        print(f"[{NAME}] COORDENADOR agora: {novo}", flush=True)
+
+
 recebidas = 0
-while True:
+
+
+def atender_cliente():
+    """Requisição de um bot, vinda do broker."""
+    global recebidas
     req = msgpack.unpackb(rep.recv())
     atualizar_clock(req.get("clock"))          # ao receber: máximo(meu, recebido)
     log("RECEBIDO", req)
@@ -224,3 +371,20 @@ while True:
     recebidas += 1
     if recebidas % HEARTBEAT_A_CADA == 0:      # a cada 10 mensagens de clientes
         heartbeat()
+    if recebidas % SYNC_A_CADA == 0:           # a cada 15 mensagens de clientes
+        sincronizar_relogio()
+
+
+# --------------------------------------------------------------------- loop
+poller = zmq.Poller()
+for sock in (peer_rep, sub, rep):
+    poller.register(sock, zmq.POLLIN)
+
+while True:
+    eventos = dict(poller.poll())              # espera qualquer um dos 3 sockets
+    if peer_rep in eventos:
+        atender_peer()
+    if sub in eventos:
+        atender_anuncio()
+    if rep in eventos:
+        atender_cliente()

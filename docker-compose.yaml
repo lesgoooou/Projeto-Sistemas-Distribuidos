@@ -6,7 +6,7 @@ services:
     build: ./proxy           # PUB/SUB: XSUB :5557 (servidores) <-> XPUB :5558 (bots)
 
   referencia:
-    build: ./referencia      # REP :5559 (só servidores): rank, lista, heartbeat e hora
+    build: ./referencia      # REP :5559 (só servidores): rank, lista e heartbeat
     # environment:
     #   HEARTBEAT_TIMEOUT: "30"   # segundos sem heartbeat até o servidor ser removido da lista
 
@@ -22,7 +22,7 @@ services:
     build: ./servidor
     environment:
       SERVER_NAME: server2
-      # CLOCK_SKEW: "5"   # descomente para simular um relógio 5 s adiantado (teste da sincronização)
+      # CLOCK_SKEW: "5"   # simula relógio 5 s adiantado; só é corrigido se este servidor NÃO for o coordenador
     volumes:
       - ./data/server2:/data
     depends_on: [broker, proxy, referencia]

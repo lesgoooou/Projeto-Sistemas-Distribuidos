@@ -1,9 +1,9 @@
-"""Serviço de referência (Parte 3).
+"""Serviço de referência (Partes 3 e 4).
 Só conversa com os servidores (nunca com os bots). Ele:
   1) dá o RANK de cada servidor (sem repetir nome)
   2) guarda e fornece a LISTA de servidores disponíveis
   3) recebe o HEARTBEAT: quem ficar muito tempo sem avisar sai da lista
-  4) devolve a HORA correta na resposta do heartbeat (sincronização do relógio físico)
+  (Parte 4: a hora não vem mais no heartbeat; quem fornece a hora é o coordenador eleito)
 """
 import os
 import time
@@ -79,7 +79,7 @@ def h_heartbeat(d):
     if not nome:
         return "erro", "nome obrigatório", {}
     registrar(nome)                              # renova (ou readmite) o servidor
-    return "ok", "", {"hora": time.time()}       # a hora correta vai junto
+    return "ok", "", {}                          # só confirma: OK
 
 
 HANDLERS = {"rank": h_rank, "list": h_list, "heartbeat": h_heartbeat}
