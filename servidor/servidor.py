@@ -27,7 +27,15 @@ SYNC_A_CADA = int(os.getenv("SYNC_A_CADA", "15"))              # mensagens de cl
 RECONCILIAR_A_CADA = int(os.getenv("RECONCILIAR_A_CADA", "100"))  # mensagens de clientes entre conferências de dados
 TOPICO_SERVIDORES = "servers"                                  # tópico reservado: anúncio do coordenador
 TOPICO_REPLICA = "replica"                                     # tópico reservado: replicação de registros
-RESERVADOS = {TOPICO_SERVIDORES, TOPICO_REPLICA}               # nomes que os bots não podem usar como canal
+TOPICO_STATUS = "status"                                       # tópico reservado: estado do servidor (só para o painel)
+RESERVADOS = {TOPICO_SERVIDORES, TOPICO_REPLICA, TOPICO_STATUS}  # nomes que os bots não podem usar como canal
+
+# ---- EXTRAS para a apresentação (fora do enunciado). Com os valores padrão, ficam desligados. ----
+STATUS_INTERVALO = float(os.getenv("STATUS_INTERVALO", "0"))   # >0: publica o estado a cada N segundos (alimenta o painel)
+FALHA_MIN = int(os.getenv("FALHA_MIN", "0"))                   # >0: o servidor "cai" depois de N mensagens de clientes,
+FALHA_MAX = int(os.getenv("FALHA_MAX", "0"))                   #     com N sorteado entre FALHA_MIN e FALHA_MAX
+FALHA_PAUSA = float(os.getenv("FALHA_PAUSA", "10"))            # segundos que ele fica fora do ar antes de voltar
+FALHA_APOS = random.randint(FALHA_MIN, max(FALHA_MIN, FALHA_MAX)) if FALHA_MIN > 0 else 0
 
 RE_USUARIO = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # nomes de usuário permitidos
 RE_CANAL = re.compile(r"^[a-z0-9_-]{1,32}$")        # nomes de canal permitidos
@@ -78,6 +86,11 @@ def mensagem(tipo: str, dados: dict, **campos) -> dict:
 
 # ------------------------------------------------------------- persistência
 os.makedirs(DATA_DIR, exist_ok=True)
+MARCADOR_QUEDA = os.path.join(DATA_DIR, ".queda")
+if os.path.exists(MARCADOR_QUEDA):       # o processo anterior "caiu" de propósito: fica fora do ar por um tempo
+    os.remove(MARCADOR_QUEDA)
+    print(f"[{NAME}] FALHA    reiniciado após uma queda simulada; volta em {FALHA_PAUSA:.0f}s", flush=True)
+    time.sleep(FALHA_PAUSA)
 db = sqlite3.connect(os.path.join(DATA_DIR, f"{NAME}.db"))
 
 # Todo registro tem: id único, origem (servidor que o criou) e clock lógico de quando foi criado.
@@ -396,6 +409,23 @@ def heartbeat():
             eleicao()
 
 
+def outro_servidor_vivo() -> bool:
+    """EXTRA: confere (perguntando direto a cada servidor) se existe outro servidor no ar."""
+    lista = pedir_ref("list")
+    if not (lista and lista.get("status") == "ok"):
+        return False
+    return any(pedir_peer(x["nome"], "relogio") is not None
+               for x in lista["dados"]["servidores"] if x["nome"] != NAME)
+
+
+def publicar_status():
+    """EXTRA: informa ao painel o estado deste servidor (não é usado pelo sistema)."""
+    contagens = {t: db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in COLUNAS}
+    msg = mensagem("status", {"nome": NAME, "rank": RANK, "coordenador": coordenador,
+                              "offset": offset, **contagens})
+    pub_sock.send_multipart([TOPICO_STATUS.encode(), msgpack.packb(msg)])
+
+
 # ----------------------------------------------------------- inicialização
 RANK = obter_rank()    # pedido ANTES de conectar ao broker, para não receber trabalho sem estar pronto
 print(f"[{NAME}] rank={RANK}", flush=True)
@@ -491,7 +521,7 @@ recebidas = 0
 
 def atender_cliente():
     """Requisição de um bot, vinda do broker."""
-    global recebidas
+    global recebidas, FALHA_APOS
     req = msgpack.unpackb(rep.recv())
     atualizar_clock(req.get("clock"))          # ao receber: máximo(meu, recebido)
     log("RECEBIDO", req)
@@ -518,6 +548,13 @@ def atender_cliente():
         sincronizar_relogio()
     if recebidas % RECONCILIAR_A_CADA == 0:    # a cada 100 mensagens de clientes
         reconciliar()
+    if FALHA_APOS and recebidas >= FALHA_APOS:  # EXTRA: queda simulada (o Docker reinicia o container)
+        if outro_servidor_vivo():
+            open(MARCADOR_QUEDA, "w").close()
+            print(f"[{NAME}] FALHA    queda simulada após {recebidas} mensagens de clientes", flush=True)
+            os._exit(1)
+        FALHA_APOS = recebidas + 10             # nunca derruba o último servidor no ar: tenta de novo depois
+        print(f"[{NAME}] FALHA    queda adiada: não há outro servidor no ar", flush=True)
 
 
 # --------------------------------------------------------------------- loop
@@ -525,8 +562,13 @@ poller = zmq.Poller()
 for sock in (peer_rep, sub, rep):
     poller.register(sock, zmq.POLLIN)
 
+ultimo_status = 0.0
 while True:
-    eventos = dict(poller.poll())              # espera qualquer um dos 3 sockets
+    # espera qualquer um dos 3 sockets (com o painel ligado, acorda a cada 1 s para publicar o status)
+    eventos = dict(poller.poll(1000 if STATUS_INTERVALO > 0 else None))
+    if STATUS_INTERVALO > 0 and time.time() - ultimo_status >= STATUS_INTERVALO:
+        publicar_status()
+        ultimo_status = time.time()
     if peer_rep in eventos:
         atender_peer()
     if sub in eventos:

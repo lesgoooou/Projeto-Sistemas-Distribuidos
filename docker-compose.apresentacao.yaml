@@ -1,0 +1,26 @@
+# EXTRAS PARA A APRESENTAÇÃO (não fazem parte do enunciado).
+# O arquivo docker-compose.yaml continua sendo o da entrega. Para a demonstração, some os dois:
+#   docker compose -f docker-compose.yaml -f docker-compose.apresentacao.yaml up --build
+# Painel em http://localhost:8080
+services:
+  painel:
+    build: ./painel
+    ports:
+      - "8080:8080"
+    depends_on: [proxy]
+
+  server1:
+    restart: on-failure            # o Docker reinicia o servidor depois da queda simulada
+    environment:
+      STATUS_INTERVALO: "1"        # publica o estado a cada 1 s (alimenta o painel)
+      FALHA_MIN: "40"              # cai depois de 40 a 70 mensagens de clientes
+      FALHA_MAX: "70"
+      FALHA_PAUSA: "12"            # e fica 12 s fora do ar
+
+  server2:
+    restart: on-failure
+    environment:
+      STATUS_INTERVALO: "1"
+      FALHA_MIN: "90"              # cai depois de 90 a 130 mensagens (depois do server1)
+      FALHA_MAX: "130"
+      FALHA_PAUSA: "12"

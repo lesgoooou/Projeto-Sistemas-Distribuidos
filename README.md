@@ -1,4 +1,4 @@
-# Projeto BBS - CC7261 - Parte 5 (versão final)
+# Projeto BBS - CC7261 - Parte 5 (versão final) + extras para apresentação
 
 Sistema de mensagens instantâneas no estilo BBS/IRC, feito só com bots. Usa ZeroMQ, MessagePack e Docker Compose.
 
@@ -25,7 +25,7 @@ MessagePack. Envelope: `{tipo, ts, clock, dados}` (+ `status` e `msg` nas respos
 - Servidor <-> referência: `rank`, `list`, `heartbeat`.
 - Servidor <-> servidor (porta 6000 de cada servidor): `eleicao`, `relogio`, `sincronizar`.
 - Servidor -> proxy -> servidores: tópico `servers` (anúncio do coordenador) e tópico `replica` (registros replicados).
-- Os nomes `servers` e `replica` são reservados: bots não podem criar nem publicar em canais com esses nomes.
+- Os nomes `servers`, `replica` e `status` são reservados: bots não podem criar nem publicar em canais com esses nomes.
 
 ## Relógio lógico
 Contador por processo: incrementa antes de enviar; ao receber, assume o máximo entre o seu e o da mensagem.
@@ -103,6 +103,23 @@ convergir sem um servidor primário e sem bloquear o atendimento dos bots para e
 - Se todos os servidores caírem ao mesmo tempo, cada banco continua em disco e as diferenças são reconciliadas na volta.
 - Na comparação, o servidor envia a lista de todos os `id`s que tem: serve para o porte do projeto, mas para um volume
   grande seria melhor trocar só um resumo (por exemplo, o maior número de sequência de cada servidor de origem).
+
+## Extras para a apresentação (fora do enunciado, desligados por padrão)
+O `docker compose up` do enunciado **não muda**: os extras só são ligados quando se soma o arquivo
+`docker-compose.apresentacao.yaml`. Nenhum componente do projeto depende deles.
+
+    docker compose -f docker-compose.yaml -f docker-compose.apresentacao.yaml up --build
+
+- **Painel web somente leitura** (`painel/`, http://localhost:8080): assina o proxy e mostra os servidores (ativo ou
+  fora do ar, coordenador, rank, ajuste do relógio, logins/canais/mensagens gravados), se as réplicas estão iguais,
+  uma linha do tempo de eventos (entrada, queda e volta de servidores, troca de coordenador), as mensagens recentes e
+  os canais. Não fala com a referência nem envia nada aos servidores.
+- **Estado dos servidores:** com `STATUS_INTERVALO` maior que zero, cada servidor publica o seu estado a cada N segundos
+  no tópico reservado `status` do proxy (só o painel o usa).
+- **Queda simulada:** com `FALHA_MIN` e `FALHA_MAX`, o servidor "cai" depois de um número aleatório de mensagens de
+  clientes nesse intervalo; o Docker o reinicia (`restart: on-failure`) e ele fica `FALHA_PAUSA` segundos fora do ar
+  antes de voltar, recuperando os dados que perdeu. Um servidor só cai se confirmar que existe outro no ar, então o
+  sistema nunca fica sem servidores por causa da simulação.
 
 ## Limitações conhecidas da sincronização de relógio
 - **O relógio do coordenador é, por definição, o correto.** Não existe fonte externa de hora (a referência deixou de
