@@ -22,14 +22,21 @@ PROXY_XPUB = os.getenv("PROXY_XPUB", "tcp://proxy:5558")      # de onde o servid
 PEER_BIND = os.getenv("PEER_BIND", "tcp://*:6000")             # porta em que este servidor atende outros servidores
 PEER_ADDR = os.getenv("PEER_ADDR", "tcp://{nome}:6000")        # endereço de um servidor (nome = nome do serviço no compose)
 PEER_TIMEOUT_MS = 2000                                         # quanto esperar uma resposta de outro servidor
-HEARTBEAT_A_CADA = int(os.getenv("HEARTBEAT_A_CADA", "10"))    # mensagens de clientes entre heartbeats
-SYNC_A_CADA = int(os.getenv("SYNC_A_CADA", "15"))              # mensagens de clientes entre sincronizações do relógio
-RECONCILIAR_A_CADA = int(os.getenv("RECONCILIAR_A_CADA", "100"))  # mensagens de clientes entre conferências de dados
+# HEARTBEAT_A_CADA = int(os.getenv("HEARTBEAT_A_CADA", "10"))    # mensagens de clientes entre heartbeats
+# SYNC_A_CADA = int(os.getenv("SYNC_A_CADA", "15"))              # mensagens de clientes entre sincronizações do relógio
+# RECONCILIAR_A_CADA = int(os.getenv("RECONCILIAR_A_CADA", "100"))  # mensagens de clientes entre conferências de dados
 TOPICO_SERVIDORES = "servers"                                  # tópico reservado: anúncio do coordenador
 TOPICO_REPLICA = "replica"                                     # tópico reservado: replicação de registros
 TOPICO_STATUS = "status"                                       # tópico reservado: estado do servidor (só para o painel)
 RESERVADOS = {TOPICO_SERVIDORES, TOPICO_REPLICA, TOPICO_STATUS}  # nomes que os bots não podem usar como canal
 
+HB_INTERVALO     = float(os.getenv("HB_INTERVALO",     "8"))   # s entre heartbeats
+SYNC_INTERVALO_T = float(os.getenv("SYNC_INTERVALO_T", "15"))  # s entre sync de relógio
+RECON_INTERVALO  = float(os.getenv("RECON_INTERVALO",  "60"))  # s entre reconciliações
+
+_t_hb   = 0.0   # instante do último heartbeat
+_t_sync = 0.0   # instante do último sync de relógio
+_t_rec  = 0.0   # instante da última reconciliação
 # ---- EXTRAS para a apresentação (fora do enunciado). Com os valores padrão, ficam desligados. ----
 STATUS_INTERVALO = float(os.getenv("STATUS_INTERVALO", "0"))   # >0: publica o estado a cada N segundos (alimenta o painel)
 FALHA_MIN = int(os.getenv("FALHA_MIN", "0"))                   # >0: o servidor "cai" depois de N mensagens de clientes,
@@ -542,12 +549,12 @@ def atender_cliente():
     log("ENVIADO", resp, f"status={status} {texto}")
 
     recebidas += 1
-    if recebidas % HEARTBEAT_A_CADA == 0:      # a cada 10 mensagens de clientes
-        heartbeat()
-    if recebidas % SYNC_A_CADA == 0:           # a cada 15 mensagens de clientes
-        sincronizar_relogio()
-    if recebidas % RECONCILIAR_A_CADA == 0:    # a cada 100 mensagens de clientes
-        reconciliar()
+    # if recebidas % HEARTBEAT_A_CADA == 0:      # a cada 10 mensagens de clientes
+    #     heartbeat()
+    # if recebidas % SYNC_A_CADA == 0:           # a cada 15 mensagens de clientes
+    #     sincronizar_relogio()
+    # if recebidas % RECONCILIAR_A_CADA == 0:    # a cada 100 mensagens de clientes
+    #     reconciliar()
     if FALHA_APOS and recebidas >= FALHA_APOS:  # EXTRA: queda simulada (o Docker reinicia o container)
         if outro_servidor_vivo():
             open(MARCADOR_QUEDA, "w").close()
@@ -556,6 +563,18 @@ def atender_cliente():
         FALHA_APOS = recebidas + 10             # nunca derruba o último servidor no ar: tenta de novo depois
         print(f"[{NAME}] FALHA    queda adiada: não há outro servidor no ar", flush=True)
 
+def tarefas_periodicas():
+    global _t_hb, _t_sync, _t_rec
+    agora_t = time.time()
+    if agora_t - _t_hb >= HB_INTERVALO:
+        heartbeat()          # dentro do heartbeat já chama eleicao() se coordenador sumiu
+        _t_hb = agora_t
+    if agora_t - _t_sync >= SYNC_INTERVALO_T:
+        sincronizar_relogio()
+        _t_sync = agora_t
+    if agora_t - _t_rec >= RECON_INTERVALO:
+        reconciliar()
+        _t_rec = agora_t
 
 # --------------------------------------------------------------------- loop
 poller = zmq.Poller()
@@ -565,7 +584,8 @@ for sock in (peer_rep, sub, rep):
 ultimo_status = 0.0
 while True:
     # espera qualquer um dos 3 sockets (com o painel ligado, acorda a cada 1 s para publicar o status)
-    eventos = dict(poller.poll(1000 if STATUS_INTERVALO > 0 else None))
+    eventos = dict(poller.poll(1000))
+    tarefas_periodicas()
     if STATUS_INTERVALO > 0 and time.time() - ultimo_status >= STATUS_INTERVALO:
         publicar_status()
         ultimo_status = time.time()

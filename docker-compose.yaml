@@ -7,8 +7,8 @@ services:
 
   referencia:
     build: ./referencia      # REP :5559 (só servidores): rank, lista e heartbeat
-    # environment:
-    #   HEARTBEAT_TIMEOUT: "30"   # segundos sem heartbeat até o servidor ser removido da lista
+    environment:
+      HEARTBEAT_TIMEOUT: "10"   # segundos sem heartbeat até o servidor ser removido da lista
 
   server1:
     build: ./servidor
@@ -25,6 +25,20 @@ services:
       # CLOCK_SKEW: "5"   # simula relógio 5 s adiantado; só é corrigido se este servidor NÃO for o coordenador
     volumes:
       - ./data/server2:/data
+    depends_on: [broker, proxy, referencia]
+  server3:
+    build: ./servidor
+    environment:
+      SERVER_NAME: server3
+    volumes:
+      - ./data/server3:/data
+    depends_on: [broker, proxy, referencia]
+  server4:
+    build: ./servidor
+    environment:
+      SERVER_NAME: server4
+    volumes:
+      - ./data/server4:/data
     depends_on: [broker, proxy, referencia]
 
   bot1:
